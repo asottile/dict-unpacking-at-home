@@ -60,12 +60,7 @@ def _make_match(
         start: int,
         equals: int,
         end: int,
-) -> list[Token]:
-    if start > 0 and tokens[start - 1].name in {'INDENT', UNIMPORTANT_WS}:
-        indent = f'{tokens[start - 1].src}{" " * 4}'
-    else:
-        indent = ' ' * 4
-
+) -> str:
     target = tokens[start:equals]
 
     for expr_start in range(equals + 1, len(tokens)):
@@ -73,18 +68,13 @@ def _make_match(
             break
     expr = tokens[expr_start:end]
 
-    error_msg = (
-        f'failed to unpack!\n\n'
-        f'line {tokens[start].line} | {tokens_to_src(tokens[start:end])}'
-    )
-
-    return [
+    return tokens_to_src([
         Token(name='NAME', src='match'),
         Token(name=UNIMPORTANT_WS, src=' '),
         *expr,
         Token(name='OP', src=':'),
         Token(name='NEWLINE', src='\n'),
-        Token(name='INDENT', src=indent),
+        Token(name='INDENT', src=' '),
         Token(name='NAME', src='case'),
         Token(name=UNIMPORTANT_WS, src=' '),
         *_shorthand(target),
@@ -92,15 +82,19 @@ def _make_match(
         Token(name=UNIMPORTANT_WS, src=' '),
         Token(name='NAME', src='pass'),
         Token(name='NEWLINE', src='\n'),
-        Token(name='INDENT', src=indent),
+        Token(name='INDENT', src=' '),
         Token(name='NAME', src='case'),
         Token(name=UNIMPORTANT_WS, src=' '),
         Token(name='NAME', src='_'),
         Token(name='OP', src=':'),
         Token(name=UNIMPORTANT_WS, src=' '),
-        Token(name='CODE', src=f'raise TypeError({error_msg!r})'),
+        Token(name='CODE', src='raise TypeError("failed to unpack!")'),
         Token(name='NEWLINE', src='\n'),
-    ]
+    ])
+
+
+def _make_exec(name: str) -> Token:
+    return Token(name='CODE', src=f'exec({name})  # ')
 
 
 def decode(b: Buffer, errors: str = 'strict') -> tuple[str, int]:
@@ -108,7 +102,6 @@ def decode(b: Buffer, errors: str = 'strict') -> tuple[str, int]:
     tokens = src_to_tokens(u)
 
     to_replace = []
-    seen_newline = True
 
     def _maybe_unpacking(start: int) -> None:
         i = start + 1
@@ -142,6 +135,18 @@ def decode(b: Buffer, errors: str = 'strict') -> tuple[str, int]:
 
         to_replace.append((start, equals, i))
 
+    # we need a blank line to inject our code and it must be before any code
+    insert = None
+    for i, token in enumerate(tokens):
+        if (
+                i > 0 and
+                token.name in {'NL', 'NEWLINE'} and
+                tokens[i - 1].name in {'NL', 'NEWLINE'}
+        ):
+            insert = i
+            break
+
+    seen_newline = True
     for i, token in enumerate(tokens):
         if seen_newline:
             if token.name in NON_CODING_TOKENS:
@@ -152,8 +157,23 @@ def decode(b: Buffer, errors: str = 'strict') -> tuple[str, int]:
         elif token.name == 'NEWLINE':
             seen_newline = True
 
-    for start, equals, end in reversed(to_replace):
-        tokens[start:end] = _make_match(tokens, start, equals, end)
+    if not to_replace:
+        return tokens_to_src(tokens), length
+    elif insert is None:
+        raise AssertionError('could not find insertion point!')
+
+    match_codes = []
+    for i, (start, equals, end) in enumerate(reversed(to_replace)):
+        n = len(to_replace) - i - 1
+        match_codes.append(_make_match(tokens, start, equals, end))
+        tokens.insert(start, _make_exec(f'_DUAH__code_{n}'))
+
+    code_src = '; '.join(
+        f'_DUAH__code_{n} = compile({code!r}, "<duah>", "exec")'
+        for n, code in enumerate(reversed(match_codes))
+    )
+    tokens.insert(insert, Token(name='CODE', src=f'{code_src}  # noqa'))
+
     return tokens_to_src(tokens), length
 
 
@@ -180,7 +200,7 @@ class StreamReader(utf_8.StreamReader):
         assert self._stream is not None
         if not self._decoded:
             text, _ = decode(self._stream.read())
-            self._stream = io.BytesIO(text.encode('UTF-8'))
+            self._stream = io.BytesIO(text.encode())
             self._decoded = True
         return self._stream
 
